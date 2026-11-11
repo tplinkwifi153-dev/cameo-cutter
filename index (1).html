@@ -1,0 +1,149 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Cameo Web Cutter</title>
+<style>
+ body { font-family: Arial, sans-serif; max-width: 800px; margin: 20px auto; padding: 0 12px; }
+ h3 { margin: 18px 0 4px; }
+ small { color: #555; display: block; margin-bottom: 4px; }
+ canvas { border: 1px solid #999; width: 100%; background: #fff; }
+ button, select, input { margin: 5px 0; padding: 8px; font-size: 15px; }
+ #log { background: #eee; padding: 8px; height: 110px; overflow: auto; font-size: 13px; color: #000; }
+</style>
+</head>
+<body>
+<h2>Cameo Web Cutter</h2>
+
+<h3>Step 1: Connect Machine</h3>
+<small>Turn on the Cameo, plug in the USB cable, then click this button and select the machine.</small>
+<button id="connect">Connect Machine</button>
+
+<h3>Step 2: Load Design</h3>
+<small>Choose an SVG file. Or click "Make Test Square" to try a simple 100 mm square.</small>
+<input type="file" id="file" accept=".svg"><br>
+<button id="testsq">Make Test Square</button>
+
+<h3>Step 3: Choose Material</h3>
+<small>This sets the speed and pressure automatically.</small>
+<select id="material">
+ <option value="5,10,10">Paper</option>
+ <option value="10,10,15">Cardstock</option>
+ <option value="13,8,10">Vinyl</option>
+</select>
+
+<h3>Step 4: Set Size</h3>
+<small>Width of the final cut in millimetres (mm). Height changes automatically.</small>
+Width (mm): <input type="number" id="w" value="50">
+
+<h3>Preview</h3>
+<small>Red lines show where the machine will cut.</small>
+<canvas id="cv" width="600" height="400"></canvas><br>
+
+<h3>Step 5: Cut</h3>
+<small>First test with a pen instead of the blade.</small>
+<button id="cut">Start Cutting</button>
+
+<h3>Status</h3>
+<div id="log"></div>
+
+<script>
+let device = null;
+let paths = []; // each path = [[x,y],[x,y],...] in mm
+const cv = document.getElementById('cv');
+const ctx = cv.getContext('2d');
+const log = m => { const l = document.getElementById('log'); l.innerHTML += m + '<br>'; l.scrollTop = l.scrollHeight; };
+
+// --- Connect to machine ---
+document.getElementById('connect').onclick = async () => {
+  try {
+    device = await navigator.usb.requestDevice({ filters: [{ vendorId: 0x0b4d }] });
+    await device.open();
+    if (device.configuration === null) await device.selectConfiguration(1);
+    await device.claimInterface(0);
+    log('Connected: ' + device.productName);
+  } catch (e) { log('Error: ' + e); }
+};
+
+// --- Read SVG ---
+document.getElementById('file').onchange = async (ev) => {
+  const text = await ev.target.files[0].text();
+  const doc = new DOMParser().parseFromString(text, 'image/svg+xml');
+  const svg = doc.documentElement;
+  document.body.appendChild(svg);
+  svg.style.display = 'none';
+  paths = [];
+  svg.querySelectorAll('path').forEach(p => {
+    const len = p.getTotalLength();
+    const pts = [];
+    const steps = Math.max(10, Math.ceil(len / 2));
+    for (let i = 0; i <= steps; i++) {
+      const pt = p.getPointAtLength(len * i / steps);
+      pts.push([pt.x, pt.y]);
+    }
+    paths.push(pts);
+  });
+  svg.remove();
+  scaleAndDraw();
+  log('Design loaded: ' + paths.length + ' path(s)');
+};
+
+// --- Test square ---
+document.getElementById('testsq').onclick = () => {
+  paths = [[[0,0],[100,0],[100,100],[0,100],[0,0]]];
+  scaleAndDraw();
+  log('Test square ready');
+};
+
+document.getElementById('w').onchange = scaleAndDraw;
+
+let scaled = [];
+function scaleAndDraw() {
+  if (!paths.length) return;
+  let minX=1e9,minY=1e9,maxX=-1e9,maxY=-1e9;
+  paths.forEach(p => p.forEach(([x,y]) => {
+    minX=Math.min(minX,x); minY=Math.min(minY,y);
+    maxX=Math.max(maxX,x); maxY=Math.max(maxY,y);
+  }));
+  const targetW = parseFloat(document.getElementById('w').value);
+  const k = targetW / (maxX - minX);
+  scaled = paths.map(p => p.map(([x,y]) => [(x-minX)*k, (y-minY)*k]));
+  ctx.clearRect(0,0,cv.width,cv.height);
+  ctx.strokeStyle = 'red';
+  const s = 4; // pixels per mm
+  scaled.forEach(p => {
+    ctx.beginPath();
+    p.forEach(([x,y],i) => i ? ctx.lineTo(x*s+20,y*s+20) : ctx.moveTo(x*s+20,y*s+20));
+    ctx.stroke();
+  });
+}
+
+// --- Send commands ---
+async function send(str) {
+  await device.transferOut(1, new TextEncoder().encode(str + '\x03'));
+}
+
+document.getElementById('cut').onclick = async () => {
+  if (!device) return log('Connect the machine first (Step 1)');
+  if (!scaled.length) return log('Load a design first (Step 2)');
+  const [speed, force, depth] = document.getElementById('material').value.split(',');
+  const u = mm => Math.round(mm * 20); // 1 mm = 20 units
+  try {
+    log('Sending cut commands...');
+    await send('\x1b\x04');   // initialize
+    await send('!' + speed);  // speed
+    await send('FX' + force); // pressure
+    for (const p of scaled) {
+      await send('M' + u(p[0][0]+10) + ',' + u(p[0][1]+10));
+      for (let i = 1; i < p.length; i++) {
+        await send('D' + u(p[i][0]+10) + ',' + u(p[i][1]+10));
+      }
+    }
+    await send('M0,0');
+    log('Done. Commands sent to the machine.');
+  } catch (e) { log('Error: ' + e); }
+};
+</script>
+</body>
+</html>
